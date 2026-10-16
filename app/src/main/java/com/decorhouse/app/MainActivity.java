@@ -1,0 +1,444 @@
+package com.decorhouse.app;
+
+import android.app.Activity;
+import android.os.Bundle;
+import android.webkit.WebView;
+import android.webkit.WebViewClient;
+import android.webkit.WebChromeClient;
+import android.webkit.WebSettings;
+import android.view.KeyEvent;
+import android.view.WindowManager;
+import android.view.View;
+import android.net.ConnectivityManager;
+import android.net.NetworkInfo;
+import android.content.Context;
+import android.content.Intent;
+import android.graphics.Bitmap;
+import android.graphics.Color;
+import android.os.Build;
+import android.widget.ProgressBar;
+import android.app.DownloadManager;
+import android.net.Uri;
+import android.os.Environment;
+import android.webkit.CookieManager;
+import android.webkit.DownloadListener;
+import android.webkit.URLUtil;
+import android.widget.Toast;
+import android.Manifest;
+import android.content.pm.PackageManager;
+import android.content.SharedPreferences;
+import android.os.Build;
+import android.widget.Toast;
+import android.webkit.CookieManager;
+import android.webkit.GeolocationPermissions;
+import android.webkit.PermissionRequest;
+import android.webkit.ServiceWorkerClient;
+import android.webkit.ServiceWorkerController;
+import android.webkit.WebResourceRequest;
+import android.webkit.WebResourceResponse;
+import androidx.core.app.ActivityCompat;
+import androidx.core.content.ContextCompat;
+import androidx.work.ExistingPeriodicWorkPolicy;
+import androidx.work.PeriodicWorkRequest;
+import androidx.work.WorkManager;
+import java.util.concurrent.TimeUnit;
+import androidx.swiperefreshlayout.widget.SwipeRefreshLayout;
+import android.app.AlertDialog;
+import android.net.Uri;
+import android.webkit.ValueCallback;
+import android.provider.MediaStore;
+import android.os.Environment;
+import android.content.ContentValues;
+import androidx.activity.result.ActivityResultLauncher;
+import androidx.activity.result.contract.ActivityResultContracts;
+
+public class MainActivity extends androidx.appcompat.app.AppCompatActivity {
+
+    private WebView webView;
+    private ProgressBar progressBar;
+    private String fcmTokenForWebView = "";
+    private static final String WEBSITE_URL = "https://decor-housee.netlify.app/#catalog";
+    private SwipeRefreshLayout swipeRefresh;
+    private ValueCallback<Uri[]> fileUploadCallback;
+    private Uri cameraImageUri;
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        getWindow().setFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN, WindowManager.LayoutParams.FLAG_FULLSCREEN);
+        setContentView(R.layout.activity_main);
+
+        webView = findViewById(R.id.webView);
+        progressBar = findViewById(R.id.progressBar);
+        swipeRefresh = findViewById(R.id.swipeRefresh);
+        swipeRefresh.setColorSchemeColors(Color.parseColor("#6366F1"));
+        swipeRefresh.setOnRefreshListener(() -> {
+            webView.reload();
+        });
+        checkAndShowRateDialog(5);
+        
+        setupWebView();
+        
+        // Enable Service Worker support (API 24+)
+        if (android.os.Build.VERSION.SDK_INT >= 24) {
+            ServiceWorkerController swController = ServiceWorkerController.getInstance();
+            swController.setServiceWorkerClient(new ServiceWorkerClient() {
+                @Override
+                public WebResourceResponse shouldInterceptRequest(WebResourceRequest request) {
+                    return null;
+                }
+            });
+        }
+
+        // Request POST_NOTIFICATIONS permission on Android 13+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+                    != PackageManager.PERMISSION_GRANTED) {
+                ActivityCompat.requestPermissions(this,
+                    new String[]{Manifest.permission.POST_NOTIFICATIONS}, 1001);
+            }
+        }
+
+        // Explicitly fetch and send FCM token at app startup
+        try {
+            com.google.firebase.messaging.FirebaseMessaging.getInstance().getToken()
+                .addOnCompleteListener(task -> {
+                    if (task.isSuccessful() && task.getResult() != null) {
+                        final String fcmToken = task.getResult();
+                        fcmTokenForWebView = fcmToken;
+                        android.util.Log.d("FCM_TOKEN", "Token received: " + fcmToken);
+
+                        // Show token status via JavaScript in WebView (debug)
+                        runOnUiThread(() -> {
+                            if (webView != null) {
+                                webView.evaluateJavascript(
+                                    "window.FCM_TOKEN = '" + fcmToken + "'; window.dispatchEvent(new Event('fcm_token_ready')); console.log('FCM Token set');", null);
+                            }
+                        });
+
+                        new Thread(() -> {
+                            try {
+                                // Endpoint is generated by PHP based on Website URL:
+                                // User app  => /fcm_token.php
+                                // Admin app => /admin/fcm_token.php
+                                String endpoint = "https://decor-housee.netlify.app/fcm_token.php";
+                                android.util.Log.d("FCM_TOKEN", "Sending token to: " + endpoint);
+
+                                java.net.URL tokenUrl = new java.net.URL(endpoint);
+                                java.net.HttpURLConnection conn = (java.net.HttpURLConnection) tokenUrl.openConnection();
+                                conn.setRequestMethod("POST");
+                                conn.setRequestProperty("Content-Type", "application/json");
+                                conn.setRequestProperty("User-Agent", "BPWalletApp/1.0");
+                                conn.setDoOutput(true);
+                                conn.setConnectTimeout(15000);
+                                conn.setReadTimeout(15000);
+                                String body = "{\"token\":\"" + fcmToken + "\"}";
+                                try (java.io.OutputStream os = conn.getOutputStream()) {
+                                    os.write(body.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                                }
+                                int status = conn.getResponseCode();
+                                android.util.Log.d("FCM_TOKEN", "POST response: HTTP " + status);
+                                conn.disconnect();
+
+                                // Fallback: GET request if POST fails
+                                if (status < 200 || status >= 300) {
+                                    android.util.Log.d("FCM_TOKEN", "POST failed, trying GET fallback...");
+                                    String t = java.net.URLEncoder.encode(fcmToken, "UTF-8");
+                                    java.net.URL fallbackUrl = new java.net.URL(endpoint + "?token=" + t);
+                                    java.net.HttpURLConnection fallbackConn = (java.net.HttpURLConnection) fallbackUrl.openConnection();
+                                    fallbackConn.setRequestMethod("GET");
+                                    fallbackConn.setRequestProperty("User-Agent", "BPWalletApp/1.0");
+                                    fallbackConn.setConnectTimeout(15000);
+                                    fallbackConn.setReadTimeout(15000);
+                                    int fbStatus = fallbackConn.getResponseCode();
+                                    android.util.Log.d("FCM_TOKEN", "GET fallback response: HTTP " + fbStatus);
+                                    fallbackConn.disconnect();
+                                }
+                            } catch (Exception e) {
+                                android.util.Log.e("FCM_TOKEN", "Error sending token: " + e.getMessage(), e);
+                            }
+                        }).start();
+                    } else {
+                        android.util.Log.e("FCM_TOKEN", "Failed to get token: " + (task.getException() != null ? task.getException().getMessage() : "unknown error"));
+                        // Show error as Toast so user can see
+                        runOnUiThread(() -> {
+                            String errMsg = task.getException() != null ? task.getException().getMessage() : "Unknown FCM error";
+                            Toast.makeText(MainActivity.this, "FCM Error: " + errMsg, Toast.LENGTH_LONG).show();
+                        });
+                    }
+                });
+        } catch (Exception e) {
+            android.util.Log.e("FCM_TOKEN", "Firebase init error: " + e.getMessage(), e);
+            Toast.makeText(this, "Firebase Error: " + e.getMessage(), Toast.LENGTH_LONG).show();
+        }
+
+        // Schedule background notification polling every 15 minutes
+        PeriodicWorkRequest workRequest = new PeriodicWorkRequest.Builder(
+            NotificationWorker.class, 15, TimeUnit.MINUTES)
+            .build();
+        WorkManager.getInstance(this).enqueueUniquePeriodicWork(
+            "notification_check",
+            ExistingPeriodicWorkPolicy.KEEP,
+            workRequest);
+        
+        
+        
+        // Handle deep link intent
+        handleIntent(getIntent());
+        
+        // Load directly; ConnectivityManager can be unreliable on some devices/VPNs.
+        // WebView will show its own error page if the connection is actually unavailable.
+        webView.loadUrl(WEBSITE_URL);
+    }
+
+    private void checkAndShowRateDialog(int targetLaunches) {
+        android.content.SharedPreferences prefs = getSharedPreferences("app_prefs", MODE_PRIVATE);
+        boolean ratedAlready = prefs.getBoolean("rated", false);
+        if (ratedAlready) return;
+        int launches = prefs.getInt("launch_count", 0) + 1;
+        prefs.edit().putInt("launch_count", launches).apply();
+        if (launches == targetLaunches) {
+            new AlertDialog.Builder(this)
+                .setTitle("Enjoying the app?")
+                .setMessage("If you like the app, please take a moment to rate it. It won't take more than a minute. Thanks!")
+                .setPositiveButton("Rate Now", (d, w) -> {
+                    prefs.edit().putBoolean("rated", true).apply();
+                    try {
+                        startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse("market://details?id=" + getPackageName())));
+                    } catch (android.content.ActivityNotFoundException e) {
+                        startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse("https://play.google.com/store/apps/details?id=" + getPackageName())));
+                    }
+                })
+                .setNeutralButton("Remind Later", null)
+                .setNegativeButton("No Thanks", (d, w) -> prefs.edit().putBoolean("rated", true).apply())
+                .show();
+        }
+    }
+
+    private void setupWebView() {
+        WebSettings webSettings = webView.getSettings();
+        webSettings.setJavaScriptEnabled(true);
+        webSettings.setDomStorageEnabled(true);
+        webSettings.setLoadWithOverviewMode(true);
+        webSettings.setUseWideViewPort(true);
+        webSettings.setBuiltInZoomControls(true);
+        webSettings.setDisplayZoomControls(false);
+        webSettings.setSupportZoom(true);
+        webSettings.setDefaultTextEncodingName("utf-8");
+        webSettings.setAllowFileAccess(true);
+        webSettings.setAllowContentAccess(true);
+        webSettings.setLoadsImagesAutomatically(true);
+        webSettings.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
+        webSettings.setCacheMode(WebSettings.LOAD_DEFAULT);
+        webSettings.setDatabaseEnabled(true);
+        webSettings.setJavaScriptCanOpenWindowsAutomatically(true);
+        webSettings.setMediaPlaybackRequiresUserGesture(false);
+        android.webkit.CookieManager.getInstance().setAcceptCookie(true);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true);
+        }
+
+        webView.setWebViewClient(new WebViewClient() {
+            @Override
+            public void onPageStarted(WebView view, String url, Bitmap favicon) {
+                super.onPageStarted(view, url, favicon);
+                if (progressBar != null) progressBar.setVisibility(View.VISIBLE);
+            }
+
+            @Override
+            public void onPageFinished(WebView view, String url) {
+                super.onPageFinished(view, url);
+                if (progressBar != null) progressBar.setVisibility(View.GONE);
+                swipeRefresh.setRefreshing(false);
+                // Save cookies for background notification worker
+                String cookies = CookieManager.getInstance().getCookie(WEBSITE_URL);
+                if (cookies != null && !cookies.isEmpty()) {
+                    getSharedPreferences("bp_prefs", MODE_PRIVATE)
+                        .edit()
+                        .putString("session_cookies", cookies)
+                        .putString("website_url", WEBSITE_URL)
+                        .apply();
+                }
+                // Re-inject FCM token after every page load so website JS can POST it with user_id/session.
+                if (fcmTokenForWebView != null && !fcmTokenForWebView.isEmpty()) {
+                    view.evaluateJavascript("window.FCM_TOKEN = '" + fcmTokenForWebView + "'; window.dispatchEvent(new Event('fcm_token_ready'));", null);
+                }
+                // Custom JavaScript injection
+                view.evaluateJavascript("<!DOCTYPE html> <html lang=\"ru\" class=\"scroll-smooth\"> <head>     <meta charset=\"UTF-8\">     <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">     <title>Decor House — Премиальный домашний текстиль и декор</title>     <!-- Tailwind CSS CDN -->     <script src=\"https://cdn.tailwindcss.com\"></script>     <link rel=\"stylesheet\" href=\"https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css\">     <script>         tailwind.config = {             theme: {                 extend: {                     colors: {                         brand: {                             50: \'#fdfbf7\',                             100: \'#f7f2e8\',                             600: \'#8c7355\',                             700: \'#6f5a41\',                             800: \'#544431\'                         }                     }                 }             }         }     </script> </head> <body class=\"bg-brand-50 text-stone-800 font-sans antialiased\">      <!-- Уведомление (Toast) -->     <div id=\"toast\" class=\"fixed top-5 right-5 z-50 transform translate-y-[-200%] transition-transform duration-300 bg-white border border-stone-200 shadow-xl rounded-xl px-4 py-3 flex items-center space-x-3\">         <div class=\"w-8 h-8 rounded-full bg-emerald-100 text-emerald-600 flex items-center justify-center\">             <i class=\"fa-solid fa-check\"></i>         </div>         <span id=\"toast-message\" class=\"text-sm font-medium text-stone-700\">Товар добавлен в корзину!</span>     </div>      <!-- Шапка сайта -->     <header class=\"sticky top-0 z-40 bg-white/90 backdrop-blur-md border-b border-stone-200 shadow-sm\">         <div class=\"max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-20 flex items-center justify-between\">             <a href=\"#\" class=\"flex items-center space-x-2 text-brand-700 font-bold text-xl tracking-wide\">                 <i class=\"fa-solid fa-house-chimney text-2xl\"></i>                 <span>Decor House</span>             </a>              <nav class=\"hidden md:flex space-x-8 text-sm font-medium text-stone-600\">                 <a href=\"#catalog\" class=\"hover:text-brand-700 transition\">Каталог</a>                 <a href=\"#categories\" class=\"hover:text-brand-700 transition\">Категории</a>                 <a href=\"#about\" class=\"hover:text-brand-700 transition\">О нас</a>                 <a href=\"#contacts\" class=\"hover:text-brand-700 transition\">Контакты</a>             </nav>              <div class=\"flex items-center space-x-4\">                 <button onclick=\"toggleFavorites()\" class=\"relative p-2 text-stone-600 hover:text-brand-700 transition\">                     <i class=\"fa-regular fa-heart text-xl\"></i>                     <span id=\"favorites-badge\" class=\"absolute top-0 right-0 bg-brand-700 text-white text-xs w-5 h-5 rounded-full flex items-center justify-center hidden\">0</span>                 </button>                 <button onclick=\"toggleCart()\" class=\"relative p-2 text-stone-600 hover:text-brand-700 transition\">                     <i class=\"fa-solid fa-bag-shopping text-xl\"></i>                     <span id=\"cart-badge\" class=\"absolute top-0 right-0 bg-brand-700 text-white text-xs w-5 h-5 rounded-full flex items-center justify-center hidden\">0</span>                 </button>             </div>         </div>     </header>      <!-- Главный баннер -->     <section class=\"relative overflow-hidden py-16 lg:py-24 bg-gradient-to-b from-brand-100 to-brand-50\">         <div class=\"max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 grid grid-cols-1 lg:grid-cols-2 gap-12 items-center\">             <div class=\"space-y-6\">                 <span class=\"inline-block bg-brand-200 text-brand-800 text-xs font-semibold px-3 py-1 rounded-full uppercase tracking-wider\">Новая коллекция 2026</span>                 <h1 class=\"text-4xl sm:text-5xl font-extrabold text-stone-900 leading-tight\">                     Создайте атмосферу <span class=\"text-brand-700 italic\">уюта</span> в вашем доме                 </h1>                 <p class=\"text-stone-600 text-lg\">                     Изысканные скатерти, мягкие ковры, элегантные занавески, постельное белье и эксклюзивный декор с доставкой.                 </p>                 <div>                     <a href=\"#catalog\" class=\"inline-flex items-center space-x-2 bg-brand-700 hover:bg-brand-800 text-white font-medium px-8 py-4 rounded-xl shadow-lg transition transform hover:-translate-y-0.5\">                         <span>Смотреть каталог</span>                         <i class=\"fa-solid fa-arrow-right\"></i>                     </a>                 </div>             </div>             <div class=\"relative\">                 <div class=\"relative rounded-3xl overflow-hidden shadow-2xl border-4 border-white\">                     <img src=\"https://images.unsplash.com/photo-1615873968403-89e068629265?auto=format&fit=crop&w=800&q=80\" alt=\"Уютный интерьер\" class=\"w-full h-[400px] object-cover\">                 </div>             </div>         </div>     </section>      <!-- Каталог товаров -->     <section id=\"catalog\" class=\"py-16 max-w-7xl mx-auto px-4 sm:px-6 lg:px-8\">         <div class=\"flex flex-col md:flex-row md:items-end justify-between mb-10\">             <div>                 <h2 class=\"text-3xl font-bold text-stone-900 mb-2\">Наш каталог</h2>                 <p class=\"text-stone-600\">Все товары отобраны с любовью и вниманием к деталям</p>             </div>             <!-- Кнопки фильтрации -->             <div class=\"flex flex-wrap gap-2 mt-4 md:mt-0\" id=\"filter-buttons\">                 <button onclick=\"filterByCategory(\'all\')\" class=\"filter-btn px-4 py-2 rounded-xl text-sm font-medium bg-brand-700 text-white transition\">Все</button>                 <button onclick=\"filterByCategory(\'Скатерти\')\" class=\"filter-btn px-4 py-2 rounded-xl text-sm font-medium bg-white text-stone-700 border border-stone-200 hover:bg-stone-100 transition\">Скатерти</button>                 <button onclick=\"filterByCategory(\'Постельное белье\')\" class=\"filter-btn px-4 py-2 rounded-xl text-sm font-medium bg-white text-stone-700 border border-stone-200 hover:bg-stone-100 transition\">Постельное белье</button>                 <button onclick=\"filterByCategory(\'Занавески\')\" class=\"filter-btn px-4 py-2 rounded-xl text-sm font-medium bg-white text-stone-700 border border-stone-200 hover:bg-stone-100 transition\">Занавески</button>                 <button onclick=\"filterByCategory(\'Ковры\')\" class=\"filter-btn px-4 py-2 rounded-xl text-sm font-medium bg-white text-stone-700 border border-stone-200 hover:bg-stone-100 transition\">Ковры</button>             </div>         </div>          <!-- Сетка товаров -->         <div id=\"product-grid\" class=\"grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-8\">             <!-- Динамически заполняется через JS -->         </div>     </section>      <!-- Корзина (Выдвижная панель) -->     <div id=\"cart-drawer\" class=\"fixed inset-0 z-50 overflow-hidden hidden\">         <div class=\"absolute inset-0 bg-black/50 transition-opacity\" onclick=\"toggleCart()\"></div>         <div class=\"absolute inset-y-0 right-0 max-w-full flex pl-10\">             <div class=\"w-screen max-w-md bg-white shadow-2xl flex flex-col\">                 <div class=\"p-6 border-b border-stone-200 flex items-center justify-between\">                     <h2 class=\"text-xl font-bold text-stone-900 flex items-center space-x-2\">                         <i class=\"fa-solid fa-bag-shopping text-brand-700\"></i>                         <span>Ваша корзина</span>                     </h2>                     <button onclick=\"toggleCart()\" class=\"text-stone-400 hover:text-stone-600\">                         <i class=\"fa-solid fa-xmark text-xl\"></i>                     </button>                 </div>                 <div id=\"cart-items\" class=\"flex-1 overflow-y-auto p-6 space-y-4\"></div>                 <div class=\"p-6 border-t border-stone-200 bg-stone-50 space-y-4\">                     <div class=\"flex justify-between text-lg font-bold text-stone-900\">                         <span>Итого:</span>                         <span id=\"cart-total\">0 ₽</span>                     </div>                     <button onclick=\"openCheckout()\" class=\"w-full bg-brand-700 hover:bg-brand-800 text-white font-medium py-3.5 rounded-xl shadow transition\">                         Оформить заказ                     </button>                 </div>             </div>         </div>     </div>      <!-- Избранное (Выдвижная панель) -->     <div id=\"favorites-drawer\" class=\"fixed inset-0 z-50 overflow-hidden hidden\">         <div class=\"absolute inset-0 bg-black/50 transition-opacity\" onclick=\"toggleFavorites()\"></div>         <div class=\"absolute inset-y-0 right-0 max-w-full flex pl-10\">             <div class=\"w-screen max-w-md bg-white shadow-2xl flex flex-col\">                 <div class=\"p-6 border-b border-stone-200 flex items-center justify-between\">                     <h2 class=\"text-xl font-bold text-stone-900 flex items-center space-x-2\">                         <i class=\"fa-solid fa-heart text-brand-700\"></i>                         <span>Избранное</span>                     </h2>                     <button onclick=\"toggleFavorites()\" class=\"text-stone-400 hover:text-stone-600\">                         <i class=\"fa-solid fa-xmark text-xl\"></i>                     </button>                 </div>                 <div id=\"favorites-items\" class=\"flex-1 overflow-y-auto p-6 space-y-4\"></div>             </div>         </div>     </div>      <!-- Модальное окно оформления заказа -->     <div id=\"checkout-modal\" class=\"fixed inset-0 z-50 overflow-y-auto hidden\">         <div class=\"flex items-center justify-center min-h-screen px-4\">             <div class=\"fixed inset-0 bg-black/50 transition-opacity\" onclick=\"closeCheckout()\"></div>             <div class=\"relative bg-white rounded-2xl max-w-lg w-full p-8 shadow-2xl z-10\">                 <div class=\"flex justify-between items-center mb-6\">                     <h2 class=\"text-2xl font-bold text-stone-900\">Оформление заказа</h2>                     <button onclick=\"closeCheckout()\" class=\"text-stone-400 hover:text-stone-600\"><i class=\"fa-solid fa-xmark text-xl\"></i></button>                 </div>                 <form id=\"checkout-form\" onsubmit=\"submitOrder(event)\" class=\"space-y-4\">                     <div>                         <label class=\"block text-sm font-medium text-stone-700 mb-1\">Ваше имя</label>                         <input type=\"text\" required class=\"w-full px-4 py-3 rounded-xl border border-stone-200 focus:ring-2 focus:ring-brand-700 focus:outline-none\" placeholder=\"Анна\">                     </div>                     <div>                         <label class=\"block text-sm font-medium text-stone-700 mb-1\">Номер телефона</label>                         <input type=\"tel\" required class=\"w-full px-4 py-3 rounded-xl border border-stone-200 focus:ring-2 focus:ring-brand-700 focus:outline-none\" placeholder=\"+7 (999) 000-00-00\">                     </div>                     <div>                         <label class=\"block text-sm font-medium text-stone-700 mb-1\">Адрес доставки</label>                         <textarea required rows=\"3\" class=\"w-full px-4 py-3 rounded-xl border border-stone-200 focus:ring-2 focus:ring-brand-700 focus:outline-none\" placeholder=\"Город, улица, дом, квартира\"></textarea>                     </div>                     <button type=\"submit\" class=\"w-full bg-brand-700 hover:bg-brand-800 text-white font-medium py-3.5 rounded-xl shadow transition\">                         Подтвердить заказ                     </button>                 </form>             </div>         </div>     </div>      <!-- JavaScript логика -->     <script>         const products = [             { id: 1, name: \'Льняная скатерть \"Прованс\"\', category: \'Скатерти\', price: 3400, image: \'https://images.unsplash.com/photo-1577140917170-285929fb55b7?auto=format&fit=crop&w=600&q=80\', description: \'Натуральный умягченный лен, размер 150х220 см\' },             { id: 2, name: \'Ковер в скандинавском стиле\', category: \'Ковры\', price: 12500, image: \'https://images.unsplash.com/photo-1600121848594-d8644e57abab?auto=format&fit=crop&w=600&q=80\', description: \'Мягкий ворс, износостойкие гипоаллергенные материалы\' },             { id: 3, name: \'Бархатные занавески \"Royal\"\', category: \'Занавески\', price: 6800, image: \'https://images.unsplash.com/photo-1513694203232-719a280e022f?auto=format&fit=crop&w=600&q=80\', description: \'Плотные светонепроницаемые портьеры премиум-класса\' },             { id: 4, name: \'Премиум постельное белье Сатин\', category: \'Постельное белье\', price: 8900, image: \'https://images.unsplash.com/photo-1522771739844-6a9f6d5f14af?auto=format&fit=crop&w=600&q=80\', description: \'100% египетский хлопок, евро размер\' },             { id: 5, name: \'Скатерть с вышивкой \"Классика\"\', category: \'Скатерти\', price: 4200, image: \'https://images.unsplash.com/photo-1530587191325-3db32d826c11?auto=format&fit=crop&w=600&q=80\', description: \'Изысканная праздничная скатерть с ручной вышивкой\' },             { id: 6, name: \'Винтажный ковер ручной работы\', category: \'Ковры\', price: 18900, image: \'https://images.unsplash.com/photo-1579656381226-5fc0f0100c3b?auto=format&fit=crop&w=600&q=80\', description: \'Эксклюзивный дизайн для гостиной или спальни\' }         ];          let cart = [];         let favorites = [];         let currentFilter = \'all\';          document.addEventListener(\'DOMContentLoaded\', () => {             renderProducts(products);         });          function renderProducts(items) {             const grid = document.getElementById(\'product-grid\');             grid.innerHTML = \'\';              if (items.length === 0) {                 grid.innerHTML = \'<p class=\"col-span-full text-center text-stone-500 py-12\">В данной категории пока нет товаров.</p>\';                 return;             }              items.forEach(product => {                 const isFavorite = favorites.some(fav => fav.id === product.id);                 const card = document.createElement(\'div\');                 card.className = \'bg-white rounded-2xl overflow-hidden shadow-md hover:shadow-xl transition flex flex-col justify-between border border-stone-100 group\';                 card.innerHTML = `                     <div class=\"relative overflow-hidden h-64 bg-stone-100\">                         <img src=\"${product.image}\" alt=\"${product.name}\" class=\"w-full h-full object-cover group-hover:scale-105 transition duration-500\">                         <button onclick=\"toggleFavorite(${product.id})\" class=\"absolute top-4 right-4 w-10 h-10 rounded-full bg-white/80 backdrop-blur-md flex items-center justify-center text-stone-700 hover:text-brand-700 shadow transition\">                             <i class=\"${isFavorite ? \'fa-solid text-red-500\' : \'fa-regular\'} fa-heart\"></i>                         </button>                         <span class=\"absolute bottom-4 left-4 bg-white/90 backdrop-blur-md text-stone-800 text-xs font-semibold px-3 py-1 rounded-full\">${product.category}</span>                     </div>                     <div class=\"p-6 flex-1 flex flex-col justify-between\">                         <div>                             <h3 class=\"font-bold text-lg text-stone-900 mb-1\">${product.name}</h3>                             <p class=\"text-stone-500 text-sm mb-4\">${product.description}</p>                         </div>                         <div class=\"flex items-center justify-between pt-4 border-t border-stone-100\">                             <span class=\"text-xl font-extrabold text-stone-900\">${product.price.toLocaleString()} ₽</span>                             <button onclick=\"addToCart(${product.id})\" class=\"bg-brand-700 hover:bg-brand-800 text-white px-4 py-2.5 rounded-xl text-sm font-medium transition shadow\">                                 В корзину                             </button>                         </div>                     </div>                 `;                 grid.appendChild(card);             });         }          function filterByCategory(category) {             currentFilter = category;                          document.querySelectorAll(\'.filter-btn\').forEach(btn => {                 btn.classList.remove(\'bg-brand-700\', \'text-white\');                 btn.classList.add(\'bg-white\', \'text-stone-700\', \'border\', \'border-stone-200\');             });             event.target.classList.remove(\'bg-white\', \'text-stone-700\', \'border\', \'border-stone-200\');             event.target.classList.add(\'bg-brand-700\', \'text-white\');              if (category === \'all\') {                 renderProducts(products);             } else {                 const filtered = products.filter(p => p.category === category);                 renderProducts(filtered);             }         }          function showToast(message) {             const toast = document.getElementById(\'toast\');             const msg = document.getElementById(\'toast-message\');             msg.innerText = message;             toast.classList.remove(\'translate-y-[-200%]\');             setTimeout(() => {                 toast.classList.add(\'translate-y-[-200%]\');             }, 3000);         }          function addToCart(productId) {             const product = products.find(p => p.id === productId);             const existing = cart.find(item => item.id === productId);              if (existing) {                 existing.quantity += 1;             } else {                 cart.push({ ...product, quantity: 1 });             }              updateCartUI();             showToast(\'Товар добавлен в корзину!\');         }          function updateCartUI() {             const cartItemsContainer = document.getElementById(\'cart-items\');             const cartBadge = document.getElementById(\'cart-badge\');             const cartTotal = document.getElementById(\'cart-total\');              const totalCount = cart.reduce((sum, item) => sum + item.quantity, 0);             if (totalCount > 0) {                 cartBadge.innerText = totalCount;                 cartBadge.classList.remove(\'hidden\');             } else {                 cartBadge.classList.add(\'hidden\');             }              cartItemsContainer.innerHTML = \'\';             if (cart.length === 0) {                 cartItemsContainer.innerHTML = \'<p class=\"text-center text-stone-500 py-8\">Ваша корзина пуста</p>\';                 cartTotal.innerText = \'0 ₽\';                 return;             }              let totalSum = 0;             cart.forEach(item => {                 totalSum += item.price * item.quantity;                 const el = document.createElement(\'div\');                 el.className = \'flex items-center justify-between bg-stone-50 p-4 rounded-xl border border-stone-200\';                 el.innerHTML = `                     <div class=\"flex items-center space-x-3\">                         <img src=\"${item.image}\" alt=\"${item.name}\" class=\"w-16 h-16 object-cover rounded-lg\">                         <div>                             <h4 class=\"font-bold text-sm text-stone-900\">${item.name}</h4>                             <p class=\"text-xs text-stone-500\">${item.price.toLocaleString()} ₽ × ${item.quantity}</p>                         </div>                     </div>                     <button onclick=\"removeFromCart(${item.id})\" class=\"text-stone-400 hover:text-red-500 p-2\">                         <i class=\"fa-solid fa-trash-can\"></i>                     </button>                 `;                 cartItemsContainer.appendChild(el);             });              cartTotal.innerText = totalSum.toLocaleString() + \' ₽\';         }          function removeFromCart(productId) {             cart = cart.filter(item => item.id !== productId);             updateCartUI();         }          function toggleCart() {             document.getElementById(\'cart-drawer\').classList.toggle(\'hidden\');         }          function toggleFavorite(productId) {             const product = products.find(p => p.id === productId);             const index = favorites.findIndex(fav => fav.id === productId);              if (index > -1) {                 favorites.splice(index, 1);                 showToast(\'Товар удален из избранного\');             } else {                 favorites.push(product);                 showToast(\'Товар добавлен в избранное\');             }              updateFavoritesUI();             const currentItems = currentFilter === \'all\' ? products : products.filter(p => p.category === currentFilter);             renderProducts(currentItems);         }          function updateFavoritesUI() {             const container = document.getElementById(\'favorites-items\');             const badge = document.getElementById(\'favorites-badge\');              if (favorites.length > 0) {                 badge.innerText = favorites.length;                 badge.classList.remove(\'hidden\');             } else {                 badge.classList.add(\'hidden\');             }              container.innerHTML = \'\';             if (favorites.length === 0) {                 container.innerHTML = \'<p class=\"text-center text-stone-500 py-8\">В избранном пока ничего нет</p>\';                 return;             }              favorites.forEach(item => {                 const el = document.createElement(\'div\');                 el.className = \'flex items-center justify-between bg-stone-50 p-4 rounded-xl border border-stone-200\';                 el.innerHTML = `                     <div class=\"flex items-center space-x-3\">                         <img src=\"${item.image}\" alt=\"${item.name}\" class=\"w-16 h-16 object-cover rounded-lg\">                         <div>                             <h4 class=\"font-bold text-sm text-stone-900\">${item.name}</h4>                             <p class=\"text-xs font-semibold text-brand-700\">${item.price.toLocaleString()} ₽</p>                         </div>                     </div>                     <button onclick=\"toggleFavorite(${item.id})\" class=\"text-red-500 hover:text-stone-400 p-2\">                         <i class=\"fa-solid fa-heart\"></i>                     </button>                 `;                 container.appendChild(el);             });         }          function toggleFavorites() {             document.getElementById(\'favorites-drawer\').classList.toggle(\'hidden\');         }          function openCheckout() {             if (cart.length === 0) {                 showToast(\'Корзина пуста!\');                 return;             }             toggleCart();             document.getElementById(\'checkout-modal\').classList.remove(\'hidden\');         }          function closeCheckout() {             document.getElementById(\'checkout-modal\').classList.add(\'hidden\');         }          function submitOrder(e) {             e.preventDefault();             closeCheckout();             cart = [];             updateCartUI();             showToast(\'Спасибо за заказ! Мы свяжемся с вами.\');         }     </script> </body> </html> <!DOCTYPE html> <html lang=\"ru\" class=\"scroll-smooth\"> <head>     <meta charset=\"UTF-8\">     <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">     <title>Decor House — Премиальный домашний текстиль и декор</title>     <!-- Tailwind CSS CDN -->     <script src=\"https://cdn.tailwindcss.com\"></script>     <link rel=\"stylesheet\" href=\"https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css\">     <script>         tailwind.config = {             theme: {                 extend: {                     colors: {                         brand: {                             50: \'#fdfbf7\',                             100: \'#f7f2e8\',                             600: \'#8c7355\',                             700: \'#6f5a41\',                             800: \'#544431\'                         }                     }                 }             }         }     </script> </head> <body class=\"bg-brand-50 text-stone-800 font-sans antialiased\">      <!-- Уведомление (Toast) -->     <div id=\"toast\" class=\"fixed top-5 right-5 z-50 transform translate-y-[-200%] transition-transform duration-300 bg-white border border-stone-200 shadow-xl rounded-xl px-4 py-3 flex items-center space-x-3\">         <div class=\"w-8 h-8 rounded-full bg-emerald-100 text-emerald-600 flex items-center justify-center\">             <i class=\"fa-solid fa-check\"></i>         </div>         <span id=\"toast-message\" class=\"text-sm font-medium text-stone-700\">Товар добавлен в корзину!</span>     </div>      <!-- Шапка сайта -->     <header class=\"sticky top-0 z-40 bg-white/90 backdrop-blur-md border-b border-stone-200 shadow-sm\">         <div class=\"max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-20 flex items-center justify-between\">             <a href=\"#\" class=\"flex items-center space-x-2 text-brand-700 font-bold text-xl tracking-wide\">                 <i class=\"fa-solid fa-house-chimney text-2xl\"></i>                 <span>Decor House</span>             </a>              <nav class=\"hidden md:flex space-x-8 text-sm font-medium text-stone-600\">                 <a href=\"#catalog\" class=\"hover:text-brand-700 transition\">Каталог</a>                 <a href=\"#categories\" class=\"hover:text-brand-700 transition\">Категории</a>                 <a href=\"#about\" class=\"hover:text-brand-700 transition\">О нас</a>                 <a href=\"#contacts\" class=\"hover:text-brand-700 transition\">Контакты</a>             </nav>              <div class=\"flex items-center space-x-4\">                 <button onclick=\"toggleFavorites()\" class=\"relative p-2 text-stone-600 hover:text-brand-700 transition\">                     <i class=\"fa-regular fa-heart text-xl\"></i>                     <span id=\"favorites-badge\" class=\"absolute top-0 right-0 bg-brand-700 text-white text-xs w-5 h-5 rounded-full flex items-center justify-center hidden\">0</span>                 </button>                 <button onclick=\"toggleCart()\" class=\"relative p-2 text-stone-600 hover:text-brand-700 transition\">                     <i class=\"fa-solid fa-bag-shopping text-xl\"></i>                     <span id=\"cart-badge\" class=\"absolute top-0 right-0 bg-brand-700 text-white text-xs w-5 h-5 rounded-full flex items-center justify-center hidden\">0</span>                 </button>             </div>         </div>     </header>      <!-- Главный баннер -->     <section class=\"relative overflow-hidden py-16 lg:py-24 bg-gradient-to-b from-brand-100 to-brand-50\">         <div class=\"max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 grid grid-cols-1 lg:grid-cols-2 gap-12 items-center\">             <div class=\"space-y-6\">                 <span class=\"inline-block bg-brand-200 text-brand-800 text-xs font-semibold px-3 py-1 rounded-full uppercase tracking-wider\">Новая коллекция 2026</span>                 <h1 class=\"text-4xl sm:text-5xl font-extrabold text-stone-900 leading-tight\">                     Создайте атмосферу <span class=\"text-brand-700 italic\">уюта</span> в вашем доме                 </h1>                 <p class=\"text-stone-600 text-lg\">                     Изысканные скатерти, мягкие ковры, элегантные занавески, постельное белье и эксклюзивный декор с доставкой.                 </p>                 <div>                     <a href=\"#catalog\" class=\"inline-flex items-center space-x-2 bg-brand-700 hover:bg-brand-800 text-white font-medium px-8 py-4 rounded-xl shadow-lg transition transform hover:-translate-y-0.5\">                         <span>Смотреть каталог</span>                         <i class=\"fa-solid fa-arrow-right\"></i>                     </a>                 </div>             </div>             <div class=\"relative\">                 <div class=\"relative rounded-3xl overflow-hidden shadow-2xl border-4 border-white\">                     <img src=\"https://images.unsplash.com/photo-1615873968403-89e068629265?auto=format&fit=crop&w=800&q=80\" alt=\"Уютный интерьер\" class=\"w-full h-[400px] object-cover\">                 </div>             </div>         </div>     </section>      <!-- Каталог товаров -->     <section id=\"catalog\" class=\"py-16 max-w-7xl mx-auto px-4 sm:px-6 lg:px-8\">         <div class=\"flex flex-col md:flex-row md:items-end justify-between mb-10\">             <div>                 <h2 class=\"text-3xl font-bold text-stone-900 mb-2\">Наш каталог</h2>                 <p class=\"text-stone-600\">Все товары отобраны с любовью и вниманием к деталям</p>             </div>             <!-- Кнопки фильтрации -->             <div class=\"flex flex-wrap gap-2 mt-4 md:mt-0\" id=\"filter-buttons\">                 <button onclick=\"filterByCategory(\'all\')\" class=\"filter-btn px-4 py-2 rounded-xl text-sm font-medium bg-brand-700 text-white transition\">Все</button>                 <button onclick=\"filterByCategory(\'Скатерти\')\" class=\"filter-btn px-4 py-2 rounded-xl text-sm font-medium bg-white text-stone-700 border border-stone-200 hover:bg-stone-100 transition\">Скатерти</button>                 <button onclick=\"filterByCategory(\'Постельное белье\')\" class=\"filter-btn px-4 py-2 rounded-xl text-sm font-medium bg-white text-stone-700 border border-stone-200 hover:bg-stone-100 transition\">Постельное белье</button>                 <button onclick=\"filterByCategory(\'Занавески\')\" class=\"filter-btn px-4 py-2 rounded-xl text-sm font-medium bg-white text-stone-700 border border-stone-200 hover:bg-stone-100 transition\">Занавески</button>                 <button onclick=\"filterByCategory(\'Ковры\')\" class=\"filter-btn px-4 py-2 rounded-xl text-sm font-medium bg-white text-stone-700 border border-stone-200 hover:bg-stone-100 transition\">Ковры</button>             </div>         </div>          <!-- Сетка товаров -->         <div id=\"product-grid\" class=\"grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-8\">             <!-- Динамически заполняется через JS -->         </div>     </section>      <!-- Корзина (Выдвижная панель) -->     <div id=\"cart-drawer\" class=\"fixed inset-0 z-50 overflow-hidden hidden\">         <div class=\"absolute inset-0 bg-black/50 transition-opacity\" onclick=\"toggleCart()\"></div>         <div class=\"absolute inset-y-0 right-0 max-w-full flex pl-10\">             <div class=\"w-screen max-w-md bg-white shadow-2xl flex flex-col\">                 <div class=\"p-6 border-b border-stone-200 flex items-center justify-between\">                     <h2 class=\"text-xl font-bold text-stone-900 flex items-center space-x-2\">                         <i class=\"fa-solid fa-bag-shopping text-brand-700\"></i>                         <span>Ваша корзина</span>                     </h2>                     <button onclick=\"toggleCart()\" class=\"text-stone-400 hover:text-stone-600\">                         <i class=\"fa-solid fa-xmark text-xl\"></i>                     </button>                 </div>                 <div id=\"cart-items\" class=\"flex-1 overflow-y-auto p-6 space-y-4\"></div>                 <div class=\"p-6 border-t border-stone-200 bg-stone-50 space-y-4\">                     <div class=\"flex justify-between text-lg font-bold text-stone-900\">                         <span>Итого:</span>                         <span id=\"cart-total\">0 ₽</span>                     </div>                     <button onclick=\"openCheckout()\" class=\"w-full bg-brand-700 hover:bg-brand-800 text-white font-medium py-3.5 rounded-xl shadow transition\">                         Оформить заказ                     </button>                 </div>             </div>         </div>     </div>      <!-- Избранное (Выдвижная панель) -->     <div id=\"favorites-drawer\" class=\"fixed inset-0 z-50 overflow-hidden hidden\">         <div class=\"absolute inset-0 bg-black/50 transition-opacity\" onclick=\"toggleFavorites()\"></div>         <div class=\"absolute inset-y-0 right-0 max-w-full flex pl-10\">             <div class=\"w-screen max-w-md bg-white shadow-2xl flex flex-col\">                 <div class=\"p-6 border-b border-stone-200 flex items-center justify-between\">                     <h2 class=\"text-xl font-bold text-stone-900 flex items-center space-x-2\">                         <i class=\"fa-solid fa-heart text-brand-700\"></i>                         <span>Избранное</span>                     </h2>                     <button onclick=\"toggleFavorites()\" class=\"text-stone-400 hover:text-stone-600\">                         <i class=\"fa-solid fa-xmark text-xl\"></i>                     </button>                 </div>                 <div id=\"favorites-items\" class=\"flex-1 overflow-y-auto p-6 space-y-4\"></div>             </div>         </div>     </div>      <!-- Модальное окно оформления заказа -->     <div id=\"checkout-modal\" class=\"fixed inset-0 z-50 overflow-y-auto hidden\">         <div class=\"flex items-center justify-center min-h-screen px-4\">             <div class=\"fixed inset-0 bg-black/50 transition-opacity\" onclick=\"closeCheckout()\"></div>             <div class=\"relative bg-white rounded-2xl max-w-lg w-full p-8 shadow-2xl z-10\">                 <div class=\"flex justify-between items-center mb-6\">                     <h2 class=\"text-2xl font-bold text-stone-900\">Оформление заказа</h2>                     <button onclick=\"closeCheckout()\" class=\"text-stone-400 hover:text-stone-600\"><i class=\"fa-solid fa-xmark text-xl\"></i></button>                 </div>                 <form id=\"checkout-form\" onsubmit=\"submitOrder(event)\" class=\"space-y-4\">                     <div>                         <label class=\"block text-sm font-medium text-stone-700 mb-1\">Ваше имя</label>                         <input type=\"text\" required class=\"w-full px-4 py-3 rounded-xl border border-stone-200 focus:ring-2 focus:ring-brand-700 focus:outline-none\" placeholder=\"Анна\">                     </div>                     <div>                         <label class=\"block text-sm font-medium text-stone-700 mb-1\">Номер телефона</label>                         <input type=\"tel\" required class=\"w-full px-4 py-3 rounded-xl border border-stone-200 focus:ring-2 focus:ring-brand-700 focus:outline-none\" placeholder=\"+7 (999) 000-00-00\">                     </div>                     <div>                         <label class=\"block text-sm font-medium text-stone-700 mb-1\">Адрес доставки</label>                         <textarea required rows=\"3\" class=\"w-full px-4 py-3 rounded-xl border border-stone-200 focus:ring-2 focus:ring-brand-700 focus:outline-none\" placeholder=\"Город, улица, дом, квартира\"></textarea>                     </div>                     <button type=\"submit\" class=\"w-full bg-brand-700 hover:bg-brand-800 text-white font-medium py-3.5 rounded-xl shadow transition\">                         Подтвердить заказ                     </button>                 </form>             </div>         </div>     </div>      <!-- JavaScript логика -->     <script>         const products = [             { id: 1, name: \'Льняная скатерть \"Прованс\"\', category: \'Скатерти\', price: 3400, image: \'https://images.unsplash.com/photo-1577140917170-285929fb55b7?auto=format&fit=crop&w=600&q=80\', description: \'Натуральный умягченный лен, размер 150х220 см\' },             { id: 2, name: \'Ковер в скандинавском стиле\', category: \'Ковры\', price: 12500, image: \'https://images.unsplash.com/photo-1600121848594-d8644e57abab?auto=format&fit=crop&w=600&q=80\', description: \'Мягкий ворс, износостойкие гипоаллергенные материалы\' },             { id: 3, name: \'Бархатные занавески \"Royal\"\', category: \'Занавески\', price: 6800, image: \'https://images.unsplash.com/photo-1513694203232-719a280e022f?auto=format&fit=crop&w=600&q=80\', description: \'Плотные светонепроницаемые портьеры премиум-класса\' },             { id: 4, name: \'Премиум постельное белье Сатин\', category: \'Постельное белье\', price: 8900, image: \'https://images.unsplash.com/photo-1522771739844-6a9f6d5f14af?auto=format&fit=crop&w=600&q=80\', description: \'100% египетский хлопок, евро размер\' },             { id: 5, name: \'Скатерть с вышивкой \"Классика\"\', category: \'Скатерти\', price: 4200, image: \'https://images.unsplash.com/photo-1530587191325-3db32d826c11?auto=format&fit=crop&w=600&q=80\', description: \'Изысканная праздничная скатерть с ручной вышивкой\' },             { id: 6, name: \'Винтажный ковер ручной работы\', category: \'Ковры\', price: 18900, image: \'https://images.unsplash.com/photo-1579656381226-5fc0f0100c3b?auto=format&fit=crop&w=600&q=80\', description: \'Эксклюзивный дизайн для гостиной или спальни\' }         ];          let cart = [];         let favorites = [];         let currentFilter = \'all\';          document.addEventListener(\'DOMContentLoaded\', () => {             renderProducts(products);         });          function renderProducts(items) {             const grid = document.getElementById(\'product-grid\');             grid.innerHTML = \'\';              if (items.length === 0) {                 grid.innerHTML = \'<p class=\"col-span-full text-center text-stone-500 py-12\">В данной категории пока нет товаров.</p>\';                 return;             }              items.forEach(product => {                 const isFavorite = favorites.some(fav => fav.id === product.id);                 const card = document.createElement(\'div\');                 card.className = \'bg-white rounded-2xl overflow-hidden shadow-md hover:shadow-xl transition flex flex-col justify-between border border-stone-100 group\';                 card.innerHTML = `                     <div class=\"relative overflow-hidden h-64 bg-stone-100\">                         <img src=\"${product.image}\" alt=\"${product.name}\" class=\"w-full h-full object-cover group-hover:scale-105 transition duration-500\">                         <button onclick=\"toggleFavorite(${product.id})\" class=\"absolute top-4 right-4 w-10 h-10 rounded-full bg-white/80 backdrop-blur-md flex items-center justify-center text-stone-700 hover:text-brand-700 shadow transition\">                             <i class=\"${isFavorite ? \'fa-solid text-red-500\' : \'fa-regular\'} fa-heart\"></i>                         </button>                         <span class=\"absolute bottom-4 left-4 bg-white/90 backdrop-blur-md text-stone-800 text-xs font-semibold px-3 py-1 rounded-full\">${product.category}</span>                     </div>                     <div class=\"p-6 flex-1 flex flex-col justify-between\">                         <div>                             <h3 class=\"font-bold text-lg text-stone-900 mb-1\">${product.name}</h3>                             <p class=\"text-stone-500 text-sm mb-4\">${product.description}</p>                         </div>                         <div class=\"flex items-center justify-between pt-4 border-t border-stone-100\">                             <span class=\"text-xl font-extrabold text-stone-900\">${product.price.toLocaleString()} ₽</span>                             <button onclick=\"addToCart(${product.id})\" class=\"bg-brand-700 hover:bg-brand-800 text-white px-4 py-2.5 rounded-xl text-sm font-medium transition shadow\">                                 В корзину                             </button>                         </div>                     </div>                 `;                 grid.appendChild(card);             });         }          function filterByCategory(category) {             currentFilter = category;                          document.querySelectorAll(\'.filter-btn\').forEach(btn => {                 btn.classList.remove(\'bg-brand-700\', \'text-white\');                 btn.classList.add(\'bg-white\', \'text-stone-700\', \'border\', \'border-stone-200\');             });             event.target.classList.remove(\'bg-white\', \'text-stone-700\', \'border\', \'border-stone-200\');             event.target.classList.add(\'bg-brand-700\', \'text-white\');              if (category === \'all\') {                 renderProducts(products);             } else {                 const filtered = products.filter(p => p.category === category);                 renderProducts(filtered);             }         }          function showToast(message) {             const toast = document.getElementById(\'toast\');             const msg = document.getElementById(\'toast-message\');             msg.innerText = message;             toast.classList.remove(\'translate-y-[-200%]\');             setTimeout(() => {                 toast.classList.add(\'translate-y-[-200%]\');             }, 3000);         }          function addToCart(productId) {             const product = products.find(p => p.id === productId);             const existing = cart.find(item => item.id === productId);              if (existing) {                 existing.quantity += 1;             } else {                 cart.push({ ...product, quantity: 1 });             }              updateCartUI();             showToast(\'Товар добавлен в корзину!\');         }          function updateCartUI() {             const cartItemsContainer = document.getElementById(\'cart-items\');             const cartBadge = document.getElementById(\'cart-badge\');             const cartTotal = document.getElementById(\'cart-total\');              const totalCount = cart.reduce((sum, item) => sum + item.quantity, 0);             if (totalCount > 0) {                 cartBadge.innerText = totalCount;                 cartBadge.classList.remove(\'hidden\');             } else {                 cartBadge.classList.add(\'hidden\');             }              cartItemsContainer.innerHTML = \'\';             if (cart.length === 0) {                 cartItemsContainer.innerHTML = \'<p class=\"text-center text-stone-500 py-8\">Ваша корзина пуста</p>\';                 cartTotal.innerText = \'0 ₽\';                 return;             }              let totalSum = 0;             cart.forEach(item => {                 totalSum += item.price * item.quantity;                 const el = document.createElement(\'div\');                 el.className = \'flex items-center justify-between bg-stone-50 p-4 rounded-xl border border-stone-200\';                 el.innerHTML = `                     <div class=\"flex items-center space-x-3\">                         <img src=\"${item.image}\" alt=\"${item.name}\" class=\"w-16 h-16 object-cover rounded-lg\">                         <div>                             <h4 class=\"font-bold text-sm text-stone-900\">${item.name}</h4>                             <p class=\"text-xs text-stone-500\">${item.price.toLocaleString()} ₽ × ${item.quantity}</p>                         </div>                     </div>                     <button onclick=\"removeFromCart(${item.id})\" class=\"text-stone-400 hover:text-red-500 p-2\">                         <i class=\"fa-solid fa-trash-can\"></i>                     </button>                 `;                 cartItemsContainer.appendChild(el);             });              cartTotal.innerText = totalSum.toLocaleString() + \' ₽\';         }          function removeFromCart(productId) {             cart = cart.filter(item => item.id !== productId);             updateCartUI();         }          function toggleCart() {             document.getElementById(\'cart-drawer\').classList.toggle(\'hidden\');         }          function toggleFavorite(productId) {             const product = products.find(p => p.id === productId);             const index = favorites.findIndex(fav => fav.id === productId);              if (index > -1) {                 favorites.splice(index, 1);                 showToast(\'Товар удален из избранного\');             } else {                 favorites.push(product);                 showToast(\'Товар добавлен в избранное\');             }              updateFavoritesUI();             const currentItems = currentFilter === \'all\' ? products : products.filter(p => p.category === currentFilter);             renderProducts(currentItems);         }          function updateFavoritesUI() {             const container = document.getElementById(\'favorites-items\');             const badge = document.getElementById(\'favorites-badge\');              if (favorites.length > 0) {                 badge.innerText = favorites.length;                 badge.classList.remove(\'hidden\');             } else {                 badge.classList.add(\'hidden\');             }              container.innerHTML = \'\';             if (favorites.length === 0) {                 container.innerHTML = \'<p class=\"text-center text-stone-500 py-8\">В избранном пока ничего нет</p>\';                 return;             }              favorites.forEach(item => {                 const el = document.createElement(\'div\');                 el.className = \'flex items-center justify-between bg-stone-50 p-4 rounded-xl border border-stone-200\';                 el.innerHTML = `                     <div class=\"flex items-center space-x-3\">                         <img src=\"${item.image}\" alt=\"${item.name}\" class=\"w-16 h-16 object-cover rounded-lg\">                         <div>                             <h4 class=\"font-bold text-sm text-stone-900\">${item.name}</h4>                             <p class=\"text-xs font-semibold text-brand-700\">${item.price.toLocaleString()} ₽</p>                         </div>                     </div>                     <button onclick=\"toggleFavorite(${item.id})\" class=\"text-red-500 hover:text-stone-400 p-2\">                         <i class=\"fa-solid fa-heart\"></i>                     </button>                 `;                 container.appendChild(el);             });         }          function toggleFavorites() {             document.getElementById(\'favorites-drawer\').classList.toggle(\'hidden\');         }          function openCheckout() {             if (cart.length === 0) {                 showToast(\'Корзина пуста!\');                 return;             }             toggleCart();             document.getElementById(\'checkout-modal\').classList.remove(\'hidden\');         }          function closeCheckout() {             document.getElementById(\'checkout-modal\').classList.add(\'hidden\');         }          function submitOrder(e) {             e.preventDefault();             closeCheckout();             cart = [];             updateCartUI();             showToast(\'Спасибо за заказ! Мы свяжемся с вами.\');         }     </script> </body> </html>", null);
+            }
+
+            @Override
+            public boolean shouldOverrideUrlLoading(WebView view, String url) {
+                return handleWebViewUrl(view, url);
+            }
+
+            @Override
+            public boolean shouldOverrideUrlLoading(WebView view, android.webkit.WebResourceRequest request) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP && request != null && request.getUrl() != null) {
+                    return handleWebViewUrl(view, request.getUrl().toString());
+                }
+                return false;
+            }
+        });
+
+        webView.setWebChromeClient(new WebChromeClient() {
+            @Override
+            public void onProgressChanged(WebView view, int newProgress) {
+                if (progressBar != null) progressBar.setProgress(newProgress);
+            }
+            
+            @Override
+            public void onPermissionRequest(PermissionRequest request) {
+                request.grant(request.getResources());
+            }
+            @Override
+            public boolean onShowFileChooser(WebView webView, ValueCallback<Uri[]> filePathCallback, FileChooserParams fileChooserParams) {
+                if (fileUploadCallback != null) {
+                    fileUploadCallback.onReceiveValue(null);
+                }
+                fileUploadCallback = filePathCallback;
+
+                // Camera intent
+                Intent cameraIntent = new Intent(MediaStore.ACTION_IMAGE_CAPTURE);
+                ContentValues values = new ContentValues();
+                values.put(MediaStore.Images.Media.TITLE, "camera_photo");
+                cameraImageUri = getContentResolver().insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
+                cameraIntent.putExtra(MediaStore.EXTRA_OUTPUT, cameraImageUri);
+
+                // File chooser intent
+                Intent fileIntent = new Intent(Intent.ACTION_GET_CONTENT);
+                fileIntent.addCategory(Intent.CATEGORY_OPENABLE);
+                fileIntent.setType("*/*");
+
+                // Combine into chooser
+                Intent chooserIntent = Intent.createChooser(fileIntent, "Select file");
+                chooserIntent.putExtra(Intent.EXTRA_INITIAL_INTENTS, new Intent[]{cameraIntent});
+
+                fileUploadLauncher.launch(chooserIntent);
+                return true;
+            }
+        });
+
+        webView.setDownloadListener(new DownloadListener() {
+            @Override
+            public void onDownloadStart(String url, String userAgent, String contentDisposition, String mimeType, long contentLength) {
+                DownloadManager.Request request = new DownloadManager.Request(Uri.parse(url));
+                request.setMimeType(mimeType);
+                String cookies = CookieManager.getInstance().getCookie(url);
+                request.addRequestHeader("cookie", cookies);
+                request.addRequestHeader("User-Agent", userAgent);
+                request.setDescription("Downloading file...");
+                request.setTitle(URLUtil.guessFileName(url, contentDisposition, mimeType));
+                request.allowScanningByMediaScanner();
+                request.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+                request.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, URLUtil.guessFileName(url, contentDisposition, mimeType));
+                DownloadManager dm = (DownloadManager) getSystemService(DOWNLOAD_SERVICE);
+                dm.enqueue(request);
+                Toast.makeText(getApplicationContext(), "Downloading File", Toast.LENGTH_LONG).show();
+            }
+        });
+    }
+
+
+    private boolean handleWebViewUrl(WebView view, String url) {
+        if (url == null || url.trim().isEmpty()) return false;
+        String lower = url.toLowerCase();
+        if (lower.startsWith("tel:") || lower.startsWith("mailto:") || lower.startsWith("sms:") || lower.startsWith("smsto:") || lower.startsWith("whatsapp:") || lower.startsWith("market:") || lower.startsWith("intent:")) {
+            try {
+                Intent intent = Intent.parseUri(url, Intent.URI_INTENT_SCHEME);
+                startActivity(intent);
+                return true;
+            } catch (Exception ignored) {
+                try {
+                    startActivity(new Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url)));
+                    return true;
+                } catch (Exception ignoredAgain) {
+                    return true;
+                }
+            }
+        }
+        if (!lower.startsWith("http://") && !lower.startsWith("https://")) {
+            return true;
+        }
+        try {
+            java.net.URL baseUrl = new java.net.URL(WEBSITE_URL);
+            java.net.URL targetUrl = new java.net.URL(url);
+            if (targetUrl.getHost() != null && !targetUrl.getHost().equalsIgnoreCase(baseUrl.getHost())) {
+                Intent browserIntent = new Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url));
+                startActivity(browserIntent);
+                return true;
+            }
+        } catch (Exception e) { /* ignore, load in webview */ }
+        view.loadUrl(url);
+        return true;
+    }
+
+    private boolean isNetworkAvailable() {
+        ConnectivityManager connectivityManager = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+        NetworkInfo activeNetworkInfo = connectivityManager.getActiveNetworkInfo();
+        return activeNetworkInfo != null && activeNetworkInfo.isConnected();
+    }
+
+    private void handleIntent(Intent intent) {
+        if (intent != null && intent.getData() != null) {
+            String deepUrl = intent.getData().toString();
+            // Custom URL scheme: convert myapp://path to website URL
+            if (deepUrl.startsWith("decorapp://")) {
+                String path = deepUrl.replace("decorapp://", "");
+                String baseUrl = WEBSITE_URL.endsWith("/") ? WEBSITE_URL : WEBSITE_URL + "/";
+                deepUrl = baseUrl + path;
+            }
+            if (deepUrl.startsWith("http")) {
+                webView.loadUrl(deepUrl);
+            }
+        }
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        handleIntent(intent);
+    }
+
+    private final ActivityResultLauncher<Intent> fileUploadLauncher = registerForActivityResult(
+        new ActivityResultContracts.StartActivityForResult(), result -> {
+            if (fileUploadCallback == null) return;
+            if (result.getResultCode() == RESULT_OK && result.getData() != null && result.getData().getData() != null) {
+                fileUploadCallback.onReceiveValue(new Uri[]{result.getData().getData()});
+            } else if (result.getResultCode() == RESULT_OK && cameraImageUri != null) {
+                fileUploadCallback.onReceiveValue(new Uri[]{cameraImageUri});
+            } else {
+                fileUploadCallback.onReceiveValue(null);
+            }
+            fileUploadCallback = null;
+        });
+
+    @Override
+    public boolean onKeyDown(int keyCode, KeyEvent event) {
+        if (keyCode == KeyEvent.KEYCODE_BACK && webView.canGoBack()) {
+            webView.goBack();
+            return true;
+        }
+        return super.onKeyDown(keyCode, event);
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        webView.onPause();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        webView.onResume();
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        if (webView != null) {
+            webView.destroy();
+        }
+    }
+}
